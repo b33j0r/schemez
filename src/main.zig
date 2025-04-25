@@ -7,13 +7,6 @@ const Expr = union(enum) {
     List: []Expr,
 };
 
-fn makeSymbol(name: []const u8) Expr {
-    return Expr{ .Symbol = name };
-}
-fn makeNumber(val: u64) Expr {
-    return Expr{ .Number = val };
-}
-
 const ws = mecha.ascii.whitespace.many(.{ .collect = false });
 
 // parseSymbol: many(alphanumeric).asStr + ws → strip ws → map to Expr.Symbol
@@ -22,7 +15,11 @@ const parseSymbol = mecha
         mecha.many(mecha.oneOf(.{ mecha.ascii.alphanumeric, mecha.ascii.char('-'), mecha.ascii.char('+'), mecha.ascii.char('*'), mecha.ascii.char('/'), mecha.ascii.char('%'), mecha.ascii.char('_'), mecha.ascii.char('='), mecha.ascii.char('!'), mecha.ascii.char('?') }), .{ .min = 1 }).asStr(),
         ws.discard(),
     })
-    .map(makeSymbol);
+    .map(struct {
+    fn makeSymbol(name: []const u8) Expr {
+        return Expr{ .Symbol = name };
+    }
+}.makeSymbol);
 
 // parseNumber: int(u64) + ws → strip ws → map to Expr.Number
 const parseNumber = mecha
@@ -30,7 +27,11 @@ const parseNumber = mecha
         mecha.int(u64, .{}),
         ws.discard(),
     })
-    .map(makeNumber);
+    .map(struct {
+    fn makeNumber(val: u64) Expr {
+        return Expr{ .Number = val };
+    }
+}.makeNumber);
 
 const lparen = token(mecha.utf8.char('('));
 const rparen = token(mecha.utf8.char(')'));
