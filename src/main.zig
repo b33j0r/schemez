@@ -7,29 +7,61 @@ const Expr = union(enum) {
     List: []Expr,
 };
 
+const Closure = struct {
+    params: [][]const u8,
+    body: Expr,
+    env: *Env,
+
+    pub fn call(self: *Closure, args: []Value) Value {
+        var local_env = Env.init();
+        defer local_env.deinit();
+
+        // Copy the parent environment
+        var it = self.env.vars.iterator();
+        while (it.next()) |entry| {
+            local_env.set(entry.key_ptr.*, entry.value_ptr.*) catch unreachable;
+        }
+
+        // Bind parameters to arguments
+        if (args.len != self.params.len) {
+            return Value{ .Symbol = "error: argument count mismatch" };
+        }
+        for (self.params, args) |param, arg| {
+            local_env.set(param, arg) catch unreachable;
+        }
+
+        // Evaluate the body in the new environment
+        return local_env.eval(self.body) catch Value{ .Symbol = "error: evaluation failed" };
+    }
+};
+
 const Value = union(enum) {
     Symbol: []const u8,
     Number: u64,
     List: []Value,
     Func: *const fn (env: *Env, args: []Value) Value,
+    Closure: *Closure,
+
+    fn toExpr(self: Value) Expr {
+        return switch (self) {
+            Value.Symbol => |s| Expr{ .Symbol = s },
+            Value.Number => |n| Expr{ .Number = n },
+            Value.List => |list| {
+                var exprs = std.ArrayList(Expr).init(std.heap.page_allocator);
+                defer exprs.deinit();
+
+                for (list) |item| {
+                    exprs.append(item.toExpr()) catch unreachable;
+                }
+
+                return Expr{ .List = exprs.toOwnedSlice() catch unreachable };
+            },
+            else => Expr{ .Symbol = "error" },
+        };
+    }
 };
 
 const Builtins = struct {
-    fn define(env: *Env, args: []Value) Value {
-        if (args.len != 2) return Value{ .Symbol = "error" }; // TODO: error handling
-
-        const name_val = args[0];
-        const value_val = args[1];
-
-        if (name_val != Value.Symbol) {
-            return Value{ .Symbol = "error" };
-        }
-
-        env.set(name_val.Symbol, value_val) catch unreachable;
-
-        return name_val;
-    }
-
     fn add(_: *Env, args: []Value) Value {
         if (args.len != 2) return Value{ .Symbol = "error" }; // TODO: error handling
 
@@ -46,6 +78,91 @@ const Builtins = struct {
         const b = args[1].Number;
 
         return Value{ .Number = a - b };
+    }
+
+    fn mul(_: *Env, args: []Value) Value {
+        if (args.len != 2) return Value{ .Symbol = "error" }; // TODO: error handling
+
+        const a = args[0].Number;
+        const b = args[1].Number;
+
+        return Value{ .Number = a * b };
+    }
+
+    fn div(_: *Env, args: []Value) Value {
+        if (args.len != 2) return Value{ .Symbol = "error" }; // TODO: error handling
+
+        const a = args[0].Number;
+        const b = args[1].Number;
+
+        if (b == 0) return Value{ .Symbol = "error: division by zero" }; // TODO: error handling
+
+        return Value{ .Number = a / b };
+    }
+
+    fn mod(_: *Env, args: []Value) Value {
+        if (args.len != 2) return Value{ .Symbol = "error" }; // TODO: error handling
+
+        const a = args[0].Number;
+        const b = args[1].Number;
+
+        if (b == 0) return Value{ .Symbol = "error: division by zero" }; // TODO: error handling
+
+        return Value{ .Number = a % b };
+    }
+};
+
+/// A “special form” takes the raw AST of its arguments (Expr[])
+/// and returns a Value without pre‐evaluating those args.
+const SpecialForms = struct {
+    // pub const FormFn = fn (env: *Env, rawArgs: []Expr) Env.EvalError!Value;
+    pub const FormFn = *const fn (env: *Env, rawArgs: []Expr) Env.EvalError!Value;
+
+    /// (define name expr) ⇒ evaluate expr, install into env under name
+    pub fn define(env: *Env, rawArgs: []Expr) Env.EvalError!Value {
+        if (rawArgs.len != 2) return Env.EvalError.EmptyApplication;
+        // first arg must be a symbol literal:
+        return switch (rawArgs[0]) {
+            Expr.Symbol => |name_sym| {
+                const val = try env.eval(rawArgs[1]);
+                try env.set(name_sym, val);
+                return val;
+            },
+            else => return Env.EvalError.NotAFunction,
+        };
+    }
+
+    /// (lambda (p1 p2 …) body) ⇒ package a Closure capturing env
+    pub fn lambda(env: *Env, rawArgs: []Expr) Env.EvalError!Value {
+        if (rawArgs.len != 2) return Env.EvalError.EmptyApplication;
+        // rawArgs[0] must be a list of symbols…
+        return switch (rawArgs[0]) {
+            Expr.List => |paramExprs| {
+                var names = std.ArrayList([]const u8).init(std.heap.page_allocator);
+                defer names.deinit();
+                for (paramExprs) |p| {
+                    switch (p) {
+                        Expr.Symbol => |s| names.append(s) catch return Env.EvalError.OutOfMemory,
+                        else => return Env.EvalError.NotAFunction,
+                    }
+                }
+                const c = std.heap.page_allocator.create(Closure) catch return Env.EvalError.OutOfMemory;
+                c.* = Closure{
+                    .params = names.toOwnedSlice() catch unreachable,
+                    .body = rawArgs[1],
+                    .env = env,
+                };
+                return Value{ .Closure = c };
+            },
+            else => return Env.EvalError.NotAFunction,
+        };
+    }
+
+    /// Lookup table for special forms
+    pub fn get(name: []const u8) ?FormFn {
+        if (std.mem.eql(u8, name, "define")) return SpecialForms.define;
+        if (std.mem.eql(u8, name, "lambda")) return SpecialForms.lambda;
+        return null;
     }
 };
 
@@ -80,15 +197,31 @@ const Env = struct {
     fn eval(self: *Env, expr: Expr) EvalError!Value {
         return switch (expr) {
             Expr.Symbol => |sym| {
-                const val = self.get(sym) orelse Value{ .Symbol = sym };
-                return val;
+                // variables or self-evaluating symbol
+                return self.get(sym) orelse Value{ .Symbol = sym };
             },
-            Expr.Number => |num| Value{ .Number = num },
+            Expr.Number => |n| Value{ .Number = n },
             Expr.List => |list| {
-                const operator = try self.eval(list[0]);
-                const func = operator.Func;
-                const args = try self.evalList(list[1..]);
-                return func(self, args);
+                if (list.len == 0) return EvalError.EmptyApplication;
+
+                // Check for special forms
+                switch (list[0]) {
+                    Expr.Symbol => |headSym| {
+                        if (SpecialForms.get(headSym)) |formFn| {
+                            return formFn(self, list[1..]);
+                        }
+                    },
+                    else => {},
+                }
+
+                // Otherwise, we have a function call:
+                const opVal = try self.eval(list[0]);
+                const argVals = try self.evalList(list[1..]);
+                return switch (opVal) {
+                    Value.Func => |fnptr| fnptr(self, argVals),
+                    Value.Closure => |c| c.call(argVals),
+                    else => return EvalError.NotAFunction,
+                };
             },
         };
     }
@@ -173,8 +306,16 @@ fn parseExprRef() mecha.Parser(Expr) {
 fn unwrap(e: Expr) Expr {
     return e;
 }
-const topExpr = mecha.combine(.{ ws.discard(), parseExpr, ws.discard() })
-    .map(unwrap);
+const topExpr = mecha.combine(.{
+    // eat whitespace
+    ws.discard(),
+    mecha.many(parseExpr, .{}),
+    ws.discard(),
+}).map(struct {
+    fn getExprs(exprs: []Expr) []Expr {
+        return exprs;
+    }
+}.getExprs);
 
 fn dump(e: Expr, indent: usize) void {
     for (0..indent) |_| std.debug.print(" ", .{});
@@ -194,30 +335,41 @@ fn token(comptime p: anytype) mecha.Parser(void) {
 
 pub fn main() !void {
     var env = Env.init();
-    env.set("define", Value{ .Func = Builtins.define }) catch |err| {
-        std.debug.print("Error setting 'define': {any}\n", .{err});
-    };
     env.set("+", Value{ .Func = Builtins.add }) catch |err| {
         std.debug.print("Error setting '+': {any}\n", .{err});
     };
     env.set("-", Value{ .Func = Builtins.sub }) catch |err| {
         std.debug.print("Error setting '-': {any}\n", .{err});
     };
+    env.set("*", Value{ .Func = Builtins.mul }) catch |err| {
+        std.debug.print("Error setting '*': {any}\n", .{err});
+    };
+    env.set("/", Value{ .Func = Builtins.div }) catch |err| {
+        std.debug.print("Error setting '/': {any}\n", .{err});
+    };
+    env.set("%", Value{ .Func = Builtins.mod }) catch |err| {
+        std.debug.print("Error setting '%': {any}\n", .{err});
+    };
 
-    // const input = "(define square (lambda (x) (* (+ x 1) x)))";
-    const input = "(+ 1 2)";
-    const res = try topExpr.parse(std.heap.page_allocator, input);
-    switch (res.value) {
-        .ok => |expr| {
-            dump(expr, 0);
-
-            const eval_result = env.eval(expr);
-            std.debug.print("Eval result: {any}\n", .{eval_result});
+    const input =
+        \\(define square-plus-1 (lambda (x) (+ (* x x) 1)))
+        \\(square-plus-1 5)
+    ;
+    // const input = "(+ 1 2)";
+    const result = try topExpr.parse(std.heap.page_allocator, input);
+    switch (result.value) {
+        .ok => |exprs| {
+            for (exprs) |expr| {
+                dump(expr, 0);
+                const val = env.eval(expr) catch |e| {
+                    std.debug.print("Eval error: {}\n", .{e});
+                    continue;
+                };
+                std.debug.print("Eval result: {any}\n", .{val});
+            }
         },
         .err => |_| {
-            // parse didn’t match — report how far we got:
-            std.debug.print("Parse failed at byte index {d}\n", .{res.index});
-            return;
+            std.debug.print("Parse failed at byte index {}\n", .{result.index});
         },
     }
 }
